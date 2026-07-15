@@ -1,0 +1,496 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_PCD8544.h>
+
+// ===== WiFi Configuration =====
+const char* ssid = "your_ssid";      // Change this!
+const char* password = "your_password";  // Change this!
+
+// ===== Nokia 5510 Display Configuration =====
+// USE D-LABELS (NOT GPIO NUMBERS)
+#define SCLK_PIN  D1  // Serial Clock (GPIO5)
+#define DIN_PIN   D2  // Data In (MOSI) (GPIO4)
+#define DC_PIN    D5  // Data/Command (GPIO14)
+#define CS_PIN    D6  // Chip Select (SCE) (GPIO12)
+#define RST_PIN   D7  // Reset (GPIO13)
+
+#define SCREEN_WIDTH  84
+#define SCREEN_HEIGHT 48
+
+// ===== Drawing Buffer =====
+bool pixelBuffer[SCREEN_WIDTH][SCREEN_HEIGHT];
+bool dirty = false;
+
+// ===== Web Server =====
+ESP8266WebServer server(80);
+
+// Create display object
+Adafruit_PCD8544 display = Adafruit_PCD8544(SCLK_PIN, DIN_PIN, DC_PIN, CS_PIN, RST_PIN);
+
+// ===== HTML Page with Drawing Canvas =====
+const char* htmlPage = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Nokia 5510 Drawing Pad</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #1a1a1a;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            font-family: Arial, sans-serif;
+            touch-action: none;
+            user-select: none;
+            -webkit-user-select: none;
+        }
+        .container {
+            background: #2a2a2a;
+            padding: 20px;
+            border-radius: 20px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+            max-width: 95vw;
+        }
+        canvas {
+            border: 3px solid #00ff88;
+            border-radius: 10px;
+            background: black;
+            touch-action: none;
+            width: 90vw;
+            max-width: 500px;
+            height: auto;
+            aspect-ratio: 84/48;
+            cursor: crosshair;
+            display: block;
+            image-rendering: pixelated;
+        }
+        .controls {
+            margin-top: 20px;
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+        button {
+            padding: 12px 28px;
+            font-size: 16px;
+            border: none;
+            border-radius: 25px;
+            cursor: pointer;
+            font-weight: bold;
+            transition: transform 0.2s;
+            touch-action: manipulation;
+            min-width: 80px;
+        }
+        button:active { transform: scale(0.92); }
+        #clearBtn {
+            background: #ff4444;
+            color: white;
+        }
+        #status {
+            color: #00ff88;
+            margin-top: 15px;
+            font-size: 14px;
+            text-align: center;
+            min-height: 20px;
+        }
+        .title {
+            color: #00ff88;
+            font-size: 18px;
+            font-weight: bold;
+            margin-bottom: 15px;
+        }
+        #pixelCount {
+            color: #888;
+            font-size: 12px;
+            margin-top: 8px;
+        }
+        .pen-size {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            color: white;
+            font-size: 14px;
+        }
+        input[type="range"] {
+            width: 80px;
+            accent-color: #00ff88;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="title">📱 Nokia 5510 Drawing</div>
+        <canvas id="canvas" width="84" height="48"></canvas>
+        <div id="pixelCount">Pixels: 0 / 4032</div>
+        <div class="controls">
+            <button id="clearBtn">🗑️ Clear</button>
+            <div class="pen-size">
+                <span>✏️</span>
+                <input type="range" id="sizeSlider" min="1" max="3" value="1">
+            </div>
+        </div>
+        <div id="status">Connected to Nokia 5510</div>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const statusDiv = document.getElementById('status');
+        const pixelCountDiv = document.getElementById('pixelCount');
+        
+        let isDrawing = false;
+        let lastX = -1;
+        let lastY = -1;
+        let penSize = 1;
+        let pixelData = new Uint8Array(84 * 48);
+        let hasUnsavedChanges = false;
+        let sendTimeout = null;
+
+        function drawPixel(x, y, size) {
+            if (x < 0 || x >= 84 || y < 0 || y >= 48) return;
+            
+            const halfSize = Math.floor(size / 2);
+            for (let dx = -halfSize; dx <= halfSize; dx++) {
+                for (let dy = -halfSize; dy <= halfSize; dy++) {
+                    const px = x + dx;
+                    const py = y + dy;
+                    if (px >= 0 && px < 84 && py >= 0 && py < 48) {
+                        ctx.fillStyle = '#ffffff';
+                        ctx.fillRect(px * 2, py * 2, 2, 2);
+                        pixelData[py * 84 + px] = 1;
+                    }
+                }
+            }
+            updatePixelCount();
+        }
+
+        function drawLine(x0, y0, x1, y1, size) {
+            const dx = Math.abs(x1 - x0);
+            const dy = Math.abs(y1 - y0);
+            const sx = (x0 < x1) ? 1 : -1;
+            const sy = (y0 < y1) ? 1 : -1;
+            let err = dx - dy;
+
+            while (true) {
+                drawPixel(x0, y0, size);
+                if (x0 === x1 && y0 === y1) break;
+                const e2 = 2 * err;
+                if (e2 > -dy) { err -= dy; x0 += sx; }
+                if (e2 < dx) { err += dx; y0 += sy; }
+            }
+        }
+
+        function updatePixelCount() {
+            let count = 0;
+            for (let i = 0; i < pixelData.length; i++) {
+                if (pixelData[i] === 1) count++;
+            }
+            pixelCountDiv.textContent = `Pixels: ${count} / 4032`;
+        }
+
+        function sendPixelData(force = false) {
+            if (!hasUnsavedChanges && !force) return;
+            
+            if (sendTimeout) {
+                clearTimeout(sendTimeout);
+                sendTimeout = null;
+            }
+            
+            sendTimeout = setTimeout(() => {
+                let data = [];
+                for (let i = 0; i < pixelData.length; i++) {
+                    data.push(pixelData[i]);
+                }
+                
+                fetch('/draw', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ pixels: Array.from(data) })
+                })
+                .then(response => response.text())
+                .then(data => {
+                    if (data === 'OK') {
+                        statusDiv.textContent = '✓ Sent to Nokia';
+                        statusDiv.style.color = '#00ff88';
+                        hasUnsavedChanges = false;
+                        setTimeout(() => {
+                            statusDiv.textContent = 'Connected to Nokia 5510';
+                        }, 1000);
+                    }
+                })
+                .catch(err => {
+                    statusDiv.textContent = '⚠️ Connection error!';
+                    statusDiv.style.color = '#ff4444';
+                });
+                sendTimeout = null;
+            }, 100);
+        }
+
+        function clearScreen() {
+            ctx.fillStyle = '#000000';
+            ctx.fillRect(0, 0, 84, 48);
+            pixelData.fill(0);
+            hasUnsavedChanges = true;
+            updatePixelCount();
+            sendPixelData(true);
+            
+            statusDiv.textContent = '🗑️ Screen cleared';
+            statusDiv.style.color = '#ffaa00';
+            setTimeout(() => {
+                statusDiv.textContent = 'Connected to Nokia 5510';
+                statusDiv.style.color = '#00ff88';
+            }, 1000);
+        }
+
+        function getCanvasCoords(e) {
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = 84 / rect.width;
+            const scaleY = 48 / rect.height;
+            
+            let clientX, clientY;
+            if (e.touches) {
+                clientX = e.touches[0].clientX;
+                clientY = e.touches[0].clientY;
+                e.preventDefault();
+            } else {
+                clientX = e.clientX;
+                clientY = e.clientY;
+            }
+            
+            return {
+                x: Math.max(0, Math.min(83, Math.floor((clientX - rect.left) * scaleX))),
+                y: Math.max(0, Math.min(47, Math.floor((clientY - rect.top) * scaleY)))
+            };
+        }
+
+        function startDraw(e) {
+            e.preventDefault();
+            isDrawing = true;
+            const pos = getCanvasCoords(e);
+            lastX = pos.x;
+            lastY = pos.y;
+            drawPixel(pos.x, pos.y, penSize);
+            hasUnsavedChanges = true;
+        }
+
+        function draw(e) {
+            e.preventDefault();
+            if (!isDrawing) return;
+            const pos = getCanvasCoords(e);
+            drawLine(lastX, lastY, pos.x, pos.y, penSize);
+            lastX = pos.x;
+            lastY = pos.y;
+            hasUnsavedChanges = true;
+            sendPixelData();
+        }
+
+        function endDraw(e) {
+            e.preventDefault();
+            if (isDrawing) {
+                isDrawing = false;
+                sendPixelData(true);
+            }
+        }
+
+        // Event Listeners
+        canvas.addEventListener('mousedown', startDraw);
+        canvas.addEventListener('mousemove', draw);
+        canvas.addEventListener('mouseup', endDraw);
+        canvas.addEventListener('mouseleave', endDraw);
+        canvas.addEventListener('touchstart', startDraw, { passive: false });
+        canvas.addEventListener('touchmove', draw, { passive: false });
+        canvas.addEventListener('touchend', endDraw, { passive: false });
+        canvas.addEventListener('touchcancel', endDraw, { passive: false });
+
+        document.getElementById('clearBtn').addEventListener('click', clearScreen);
+        document.getElementById('clearBtn').addEventListener('touchstart', (e) => {
+            e.preventDefault();
+            clearScreen();
+        });
+
+        document.getElementById('sizeSlider').addEventListener('input', (e) => {
+            penSize = parseInt(e.target.value);
+        });
+
+        setInterval(() => {
+            if (hasUnsavedChanges) {
+                sendPixelData();
+            }
+        }, 2000);
+
+        clearScreen();
+        console.log('Nokia 5510 Drawing Pad ready!');
+    </script>
+</body>
+</html>
+)rawliteral";
+
+// ============================================================
+// ===== ESP8266 Server Functions =====
+// ============================================================
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialize Nokia 5510 display
+  display.begin();
+  display.setContrast(50);
+  display.setRotation(2);
+  display.clearDisplay();
+  display.display();
+  
+  clearBuffer();
+  renderBuffer();
+  
+  // Connect to WiFi
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected!");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+  
+  // Show IP on Nokia display
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(BLACK, WHITE);
+  display.setCursor(0, 0);
+  display.println("IP:");
+  display.println(WiFi.localIP().toString());
+  display.println("Draw on:");
+  display.println(WiFi.localIP().toString());
+  display.display();
+  
+  // Setup web server routes
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/draw", HTTP_POST, handleDraw);
+  server.on("/clear", HTTP_GET, handleClear);
+  
+  server.begin();
+  Serial.println("HTTP server started");
+}
+
+void loop() {
+  server.handleClient();
+  
+  if (dirty) {
+    renderBuffer();
+    dirty = false;
+  }
+  
+  // ===== AUTO-CLEAR AFTER INACTIVITY =====
+  static unsigned long lastDrawTime = millis();
+  
+  // Check if screen has any pixels
+  bool hasPixels = false;
+  for (int x = 0; x < SCREEN_WIDTH; x++) {
+    for (int y = 0; y < SCREEN_HEIGHT; y++) {
+      if (pixelBuffer[x][y]) {
+        hasPixels = true;
+        break;
+      }
+    }
+    if (hasPixels) break;
+  }
+  
+  // Reset timer if there are pixels (user is drawing)
+  if (hasPixels) {
+    lastDrawTime = millis();
+  }
+  
+  // Auto-clear after 30 seconds of no drawing AND empty screen
+  if (!hasPixels && millis() - lastDrawTime > 30000) {
+    clearBuffer();
+    dirty = true;
+    lastDrawTime = millis();
+    Serial.println("Auto-cleared after inactivity");
+  }
+  // ===== END AUTO-CLEAR =====
+  
+  delay(10);
+}
+
+// ===== Web Handlers =====
+
+void handleRoot() {
+  server.send(200, "text/html", htmlPage);
+}
+
+void handleDraw() {
+  if (server.hasArg("plain")) {
+    String json = server.arg("plain");
+    
+    int startIndex = json.indexOf('[');
+    int endIndex = json.indexOf(']');
+    if (startIndex != -1 && endIndex != -1) {
+      String pixelData = json.substring(startIndex + 1, endIndex);
+      
+      int count = 0;
+      int pos = 0;
+      while (pos < pixelData.length() && count < SCREEN_WIDTH * SCREEN_HEIGHT) {
+        int nextComma = pixelData.indexOf(',', pos);
+        String valueStr;
+        if (nextComma != -1) {
+          valueStr = pixelData.substring(pos, nextComma);
+          pos = nextComma + 1;
+        } else {
+          valueStr = pixelData.substring(pos);
+          pos = pixelData.length();
+        }
+        valueStr.trim();
+        int value = valueStr.toInt();
+        
+        int x = count % SCREEN_WIDTH;
+        int y = count / SCREEN_WIDTH;
+        pixelBuffer[x][y] = (value == 1);
+        count++;
+      }
+      
+      dirty = true;
+      server.send(200, "text/plain", "OK");
+      return;
+    }
+  }
+  server.send(400, "text/plain", "Bad Request");
+}
+
+void handleClear() {
+  clearBuffer();
+  dirty = true;
+  server.send(200, "text/plain", "Cleared");
+}
+
+// ===== Display Buffer Functions =====
+
+void clearBuffer() {
+  for (int x = 0; x < SCREEN_WIDTH; x++) {
+    for (int y = 0; y < SCREEN_HEIGHT; y++) {
+      pixelBuffer[x][y] = false;
+    }
+  }
+}
+
+void renderBuffer() {
+  display.clearDisplay();
+  
+  for (int x = 0; x < SCREEN_WIDTH; x++) {
+    for (int y = 0; y < SCREEN_HEIGHT; y++) {
+      if (pixelBuffer[x][y]) {
+        display.drawPixel(x, y, BLACK);
+      }
+    }
+  }
+  
+  display.display();
+}
